@@ -1237,3 +1237,573 @@ DELETE /api/transactions/<id>          → delete + reverse balance
 ```
 
 Once all Thunder Client tests pass on the basic routes, swap to the wallet `app.py` and test those routes next.
+
+
+## Flask Session Summary — Authentication & JWT
+
+---
+
+## What was covered
+
+```
+Topic 1 → Sessions — server remembers logged-in user
+Topic 2 → JWT — stateless token-based authentication
+Topic 3 → token_required decorator — protect routes
+Topic 4 → refresh token — extend session without re-login
+Topic 5 → Full app.py with JWT integrated
+```
+
+---
+
+## Why Authentication
+
+```
+Without auth — current state:
+Anyone can POST /api/transactions
+Anyone can DELETE any transaction
+No way to know WHO is making the request
+
+With auth:
+Login → get token
+Every request sends token → Flask verifies it
+Only the right user can touch their own data
+```
+
+---
+
+## Topic 1 — Sessions (basic, then replaced by JWT)
+
+Sessions = Flask remembers the user on the server side:
+
+```python
+from flask import session
+
+app.config["SECRET_KEY"] = "wallet-secret-key"
+# SECRET_KEY is used to encrypt the session cookie
+# without it Flask throws an error
+
+# login — store user in session
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    user = User.query.filter_by(
+        first_name = data.get("first_name"),
+        last_name  = data.get("last_name")
+    ).first()
+
+    if not user or user.password != data.get("password"):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    session["user_id"] = user.id    # store in session
+    return jsonify({"message": "Login successful", "user": user.to_dict()})
+
+
+# logout — clear session
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.pop("user_id", None)
+    return jsonify({"message": "Logged out successfully"})
+
+
+# protect a route using session
+@app.route("/api/transactions", methods=["POST"])
+def create_transaction():
+    if "user_id" not in session:
+        return jsonify({"error": "Login required"}), 401
+    # proceed with transaction
+```
+
+Problem with sessions:
+
+```
+Sessions are stored on the server
+React runs on a different port — CORS blocks cookies
+Doesn't scale well for multiple servers
+→ Solution: JWT (JSON Web Tokens)
+```
+
+---
+
+## Topic 2 — JWT Authentication
+
+### What is JWT
+
+```
+Session (old way):           JWT (new way):
+Server stores user info      Server sends a TOKEN to client
+Client sends cookie          Client stores token, sends it in every request
+Stateful — server remembers  Stateless — server just verifies the token
+
+Token looks like:
+eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxfQ.abc123
+  ↑ header (base64)            ↑ payload (user data)        ↑ signature
+```
+
+### Flow
+
+```
+1. User logs in with credentials
+        ↓
+2. Flask verifies password → generates JWT token
+        ↓
+3. Token sent to React → stored in localStorage
+        ↓
+4. Every request from React includes:
+   Authorization: Bearer <token>
+        ↓
+5. Flask decodes token → gets user_id → processes request
+        ↓
+6. Token expires after 1 hour → user must login again
+   OR use refresh token to get a new one
+```
+
+### Install
+
+```bash
+pip install PyJWT
+```
+
+---
+
+## Topic 3 — Step by Step Implementation
+
+### Step 1 — Add imports to `app.py`
+
+```python
+import jwt
+from datetime import datetime, timedelta
+from functools import wraps
+```
+
+---
+
+### Step 2 — Update login route to return JWT token
+
+```python
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    # find user — mirrors storage_service.py load_user()
+    user = User.query.filter_by(
+        first_name = data.get("first_name"),
+        last_name  = data.get("last_name")
+    ).first()
+
+    # check password — mirrors user.py check_password()
+    if not user or user.password != data.get("password"):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    # generate JWT token
+    payload = {
+        "user_id": user.id,
+        "exp":     datetime.utcnow() + timedelta(hours=1)
+        # exp = expiry — token invalid after 1 hour
+    }
+    token = jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+    # PyJWT 2.x returns string directly
+    # PyJWT 1.x returns bytes — decode to string
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+
+    return jsonify({
+        "token": token,
+        "user":  user.to_dict()
+    })
+```
+
+Thunder Client test:
+```
+POST http://127.0.0.1:5000/api/login
+{
+    "first_name": "Vinod",
+    "last_name":  "Kumar",
+    "password":   "Vin12345"
+}
+
+Expected response:
+{
+    "token": "eyJ0eXAiOiJKV1Qi...",
+    "user": {
+        "id": 1,
+        "first_name": "Vinod",
+        "account_type": "Premium",
+        "wallet_balance": 1000.0
+    }
+}
+```
+
+---
+
+### Step 3 — Create `token_required` decorator
+
+This is your route guard — same idea as `ProtectedRoute` in React but on the backend:
+
+```python
+def token_required(f):
+    @wraps(f)    # preserves the original function name
+    def decorated(*args, **kwargs):
+
+        # 1. get token from request header
+        token = request.headers.get("Authorization")
+        # header looks like: Authorization: Bearer eyJ0eXAi...
+
+        # 2. check token exists and has correct format
+        if not token or not token.startswith("Bearer "):
+            return jsonify({"error": "Token is missing"}), 401
+
+        # 3. extract just the token part (remove "Bearer ")
+        token = token.split()[1]
+
+        try:
+            # 4. decode token — verifies signature and expiry
+            payload = jwt.decode(
+                token,
+                app.config["SECRET_KEY"],
+                algorithms=["HS256"]
+            )
+            # 5. get user from decoded payload
+            current_user = db.session.get(User, payload["user_id"])
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+
+        # 6. pass current_user to the route function
+        return f(current_user, *args, **kwargs)
+
+    return decorated
+```
+
+---
+
+### Step 4 — Protect the POST transaction route
+
+```python
+# ── BEFORE (no auth) ──────────────────────────────
+@app.route("/api/transactions", methods=["POST"])
+def create_transaction():
+    data = request.get_json()
+    user = db.session.get(User, data["userId"])   # trusted userId from body
+    ...
+
+
+# ── AFTER (with JWT) ──────────────────────────────
+@app.route("/api/transactions", methods=["POST"])
+@token_required                                    # ← add this decorator
+def create_transaction(current_user):              # ← user comes from token now
+    data = request.get_json()
+    # current_user is already verified — no need to look up by userId
+
+    amount   = data.get("amount")
+    txn_type = data.get("type")
+
+    # validate amount
+    if not amount or float(amount) <= 0:
+        return jsonify({"error": "Invalid amount"}), 400
+
+    # validate type
+    if txn_type not in ["credit", "debit"]:
+        return jsonify({"error": "Type must be credit or debit"}), 400
+
+    amount = float(amount)
+
+    # check transaction limit — mirrors user.py get_transaction_limit()
+    if amount > current_user.get_transaction_limit():
+        return jsonify({
+            "error": f"Exceeds limit of ₹{current_user.get_transaction_limit()}"
+        }), 400
+
+    # calculate fee — mirrors wallet_service.py calculate_fee()
+    fee        = round(amount * current_user.get_fee_rate(), 2)
+    net_amount = round(
+        amount - fee if txn_type == "credit" else -(amount + fee),
+        2
+    )
+
+    # check balance for debit
+    if txn_type == "debit" and current_user.wallet_balance + net_amount < 0:
+        return jsonify({"error": "Insufficient balance"}), 400
+
+    # create transaction
+    txn = Transaction(
+        user_id    = current_user.id,
+        type       = txn_type,
+        amount     = amount,
+        fee        = fee,
+        net_amount = net_amount
+    )
+    db.session.add(txn)
+
+    # update balance and cashback
+    current_user.wallet_balance = round(current_user.wallet_balance + net_amount, 2)
+    if current_user.account_type == "Premium" and txn_type == "credit":
+        current_user.cashback = round(current_user.cashback + amount * 0.05, 2)
+
+    db.session.commit()
+    return jsonify(txn.to_dict()), 201
+```
+
+---
+
+### Step 5 — Add refresh token route
+
+```python
+# POST /api/refresh — get a new token before old one expires
+@app.route("/api/refresh", methods=["POST"])
+def refresh_token():
+    token = request.headers.get("Authorization")
+
+    if not token or not token.startswith("Bearer "):
+        return jsonify({"error": "Token is missing"}), 401
+
+    token = token.split()[1]
+
+    try:
+        # decode WITHOUT checking expiry — so expired tokens can be refreshed
+        payload = jwt.decode(
+            token,
+            app.config["SECRET_KEY"],
+            algorithms=["HS256"],
+            options={"verify_exp": False}    # ← skip expiry check
+        )
+
+        # generate new token with fresh expiry
+        new_payload = {
+            "user_id": payload["user_id"],
+            "exp":     datetime.utcnow() + timedelta(hours=1)
+        }
+        new_token = jwt.encode(new_payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+        if isinstance(new_token, bytes):
+            new_token = new_token.decode("utf-8")
+
+        return jsonify({"token": new_token})
+
+    except Exception:
+        return jsonify({"error": "Invalid refresh request"}), 401
+```
+
+---
+
+## Topic 4 — Update React to send JWT token
+
+### Update `api.js` — add token to every request
+
+```javascript
+// src/services/api.js
+const BASE_URL = "http://127.0.0.1:5000";
+
+// helper — gets token from localStorage
+const getToken = () => localStorage.getItem("token");
+
+// helper — builds auth headers
+const authHeaders = () => ({
+    "Content-Type":  "application/json",
+    "Authorization": `Bearer ${getToken()}`    // ← sent with every request
+});
+
+
+// ── AUTH ──────────────────────────────────────────
+
+export const loginUser = async (credentials) => {
+    const res = await fetch(`${BASE_URL}/api/login`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(credentials)
+    });
+    if (!res.ok) throw new Error("Invalid credentials");
+
+    const data = await res.json();
+
+    // save token to localStorage — sent with every future request
+    localStorage.setItem("token",       data.token);
+    localStorage.setItem("currentUser", JSON.stringify(data.user));
+
+    return data.user;
+};
+
+export const registerUser = async (userData) => {
+    const res = await fetch(`${BASE_URL}/api/users`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(userData)
+    });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    return res.json();
+};
+
+export const refreshToken = async () => {
+    const res = await fetch(`${BASE_URL}/api/refresh`, {
+        method:  "POST",
+        headers: authHeaders()
+    });
+    if (!res.ok) throw new Error("Refresh failed");
+    const data = await res.json();
+    localStorage.setItem("token", data.token);   // save new token
+    return data.token;
+};
+
+
+// ── TRANSACTIONS ───────────────────────────────────
+
+export const fetchTransactions = async (userId) => {
+    const res = await fetch(`${BASE_URL}/api/transactions?userId=${userId}`, {
+        headers: authHeaders()    // ← token required
+    });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    return res.json();
+};
+
+export const postTransaction = async (txnData) => {
+    const res = await fetch(`${BASE_URL}/api/transactions`, {
+        method:  "POST",
+        headers: authHeaders(),   // ← token required
+        body:    JSON.stringify(txnData)
+    });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    return res.json();
+};
+
+export const deleteTransaction = async (txnId) => {
+    const res = await fetch(`${BASE_URL}/api/transactions/${txnId}`, {
+        method:  "DELETE",
+        headers: authHeaders()
+    });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    return res.json();
+};
+
+export const fetchSummary = async (userId) => {
+    const res = await fetch(`${BASE_URL}/api/transactions/summary?userId=${userId}`, {
+        headers: authHeaders()
+    });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    return res.json();
+};
+```
+
+---
+
+### Update `Login.jsx` — save token after login
+
+```jsx
+import { loginUser } from "../services/api";
+
+const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+        // loginUser now saves token to localStorage automatically
+        const user = await loginUser({
+            first_name: firstName,
+            last_name:  lastName,
+            password
+        });
+        setUser(user);
+        navigate("/dashboard");
+    } catch (err) {
+        setError("Invalid credentials");
+    } finally {
+        setLoading(false);
+    }
+};
+```
+
+### Update `Navbar.jsx` — clear token on logout
+
+```jsx
+function handleLogout() {
+    localStorage.removeItem("currentUser");
+    localStorage.removeItem("token");        // ← also remove token
+    setUser(null);
+    navigate("/login");
+}
+```
+
+---
+
+## Thunder Client tests for JWT
+
+**Test 1 — Login and get token:**
+```
+POST http://127.0.0.1:5000/api/login
+{
+    "first_name": "Vinod",
+    "last_name":  "Kumar",
+    "password":   "Vin12345"
+}
+Expected: { "token": "eyJ...", "user": {...} }
+```
+
+**Test 2 — POST transaction WITH token:**
+```
+POST http://127.0.0.1:5000/api/transactions
+Headers tab → Add:
+    Authorization: Bearer eyJ0eXAiOiJKV1Qi...  ← paste your token
+Body → JSON:
+{
+    "type":   "credit",
+    "amount": 500
+}
+Expected: { "id": 1, "type": "credit", "amount": 500, "fee": 5.0 }
+```
+
+**Test 3 — POST transaction WITHOUT token:**
+```
+POST http://127.0.0.1:5000/api/transactions
+No Authorization header
+Body: { "type": "credit", "amount": 500 }
+Expected: { "error": "Token is missing" }  ← 401
+```
+
+**Test 4 — Refresh token:**
+```
+POST http://127.0.0.1:5000/api/refresh
+Headers: Authorization: Bearer <your_token>
+Expected: { "token": "eyJ...new_token..." }
+```
+
+---
+
+## Complete flow — Sessions vs JWT
+
+| | Sessions | JWT |
+|---|---|---|
+| Stored on | Server | Client (localStorage) |
+| Sent as | Cookie | Authorization header |
+| Works with React | Needs extra CORS config | Works easily |
+| Logout | Server clears session | Client deletes token |
+| Expiry | Controlled by server | Embedded in token (1 hour) |
+| Scalable | No — server stores state | Yes — stateless |
+
+---
+
+## Full `app.py` — what each section does
+
+```
+imports          → jwt, datetime, timedelta, wraps, re
+Config           → SECRET_KEY for JWT + session encryption
+Models           → User, Transaction with get_fee_rate(), get_transaction_limit()
+validate_password → regex check — mirrors user.py set_password()
+token_required   → decorator — protects routes, extracts current_user from token
+
+Routes:
+GET  /               → health check
+GET  /api/users      → all users
+GET  /api/users/<id> → one user
+POST /api/users      → register with password validation
+PUT  /api/users/<id> → update profile
+PUT  /api/users/<id>/password → change password
+POST /api/login      → verify credentials → return JWT token
+POST /api/refresh    → return new JWT token
+
+GET    /api/transactions?userId=  → all transactions for user
+GET    /api/transactions/<id>     → one transaction
+POST   /api/transactions          → @token_required — add transaction
+DELETE /api/transactions/<id>     → delete + reverse balance
+GET    /api/transactions/summary  → totals for user
+```
